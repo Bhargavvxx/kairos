@@ -263,6 +263,8 @@ class Node(TimestampedModel, VersionedModel):
     source_documents: List[str] = Field(default_factory=list, description="IDs of documents from which this node was extracted.")
     aliases: List[str] = Field(default_factory=list, description="Alternative names or identifiers for this entity.")
     tags: Set[str] = Field(default_factory=set, description="Tags for categorization and filtering.")
+    description: Optional[str] = Field(default=None, description="Natural language description or summary of the node.")
+
     
     # 🏆 HACKRX 6.0 SMART VALIDATORS - THE MAIN FIX
     @validator('type', pre=True)

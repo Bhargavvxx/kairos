@@ -15,7 +15,8 @@ import os
 import platform
 import json
 import time
-from rank_bm25 import BM25Okapi  # ADD THIS IMPORT
+import pickle
+from rank_bm25 import BM25Okapi
 
 # Attempt to import and configure spaCy, with NLTK as a fallback for sentence splitting.
 try:
@@ -31,18 +32,57 @@ except ImportError:
     except LookupError:
         nltk.download('punkt', quiet=True)
 
-# --- Service Class Definition ---
+# --- Document Cache Class ---
+class DocumentCache:
+    """Cache for processed documents to avoid reprocessing"""
+    def __init__(self, cache_dir: str = "./cache"):
+        self.cache_dir = cache_dir
+        self.cache_file = os.path.join(cache_dir, "document_cache.pkl")
+        self.cache = {}
+        self._load_cache()
+    
+    def _load_cache(self):
+        """Load cache from disk"""
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            if os.path.exists(self.cache_file):
+                with open(self.cache_file, 'rb') as f:
+                    self.cache = pickle.load(f)
+        except Exception:
+            self.cache = {}
+    
+    def _save_cache(self):
+        """Save cache to disk"""
+        try:
+            with open(self.cache_file, 'wb') as f:
+                pickle.dump(self.cache, f)
+        except Exception:
+            pass
+    
+    def get_cached(self, doc_hash: str) -> Optional[Dict]:
+        """Get cached document data"""
+        return self.cache.get(doc_hash)
+    
+    def set_cache(self, doc_hash: str, data: Dict):
+        """Cache document data"""
+        self.cache[doc_hash] = {
+            **data,
+            'cached_at': datetime.utcnow().isoformat()
+        }
+        self._save_cache()
 
+# --- Service Class Definition ---
 class VectorService:
     """
     Production-ready vector service with performance optimizations for KAIROS.
     Features embedding caching, async operations, intelligent chunking, and improved deduplication.
     Enhanced for HackRx 6.0 with smart embedding dimension handling.
+    Optimized for <40 second processing with aggressive caching and faster model.
     """
 
     def __init__(
         self, 
-        model_name: str = 'all-mpnet-base-v2',
+        model_name: str = 'all-MiniLM-L6-v2',  # CHANGED: Faster model
         collection_name: str = "kairos_documents",
         persist_directory: Optional[str] = "./chroma_db",
         batch_size: Optional[int] = None,
@@ -53,7 +93,7 @@ class VectorService:
         Initialize VectorService with performance optimizations.
         
         Args:
-            model_name: SentenceTransformer model name
+            model_name: SentenceTransformer model name (default changed to faster model)
             collection_name: ChromaDB collection name
             persist_directory: Directory for persistent storage
             batch_size: Batch size for encoding (auto-detect if None)
@@ -62,6 +102,9 @@ class VectorService:
         """
         self.logger = logging.getLogger(__name__)
         self.logger.info(f"Initializing VectorService with model: {model_name}")
+
+        # Initialize document cache
+        self.doc_cache = DocumentCache()
 
         # Initialize ChromaDB client with improved settings
         if persist_directory:
@@ -101,18 +144,22 @@ class VectorService:
         initial_count = self.collection.count()
         self.logger.info(f"Collection '{collection_name}' ready with {initial_count} chunks")
 
-        # Load the sentence-transformer model
+        # Load the sentence-transformer model - OPTIMIZED
         try:
             self.model = SentenceTransformer(model_name)
+            # Enable internal normalization if available
+            if hasattr(self.model._first_module(), 'normalize'):
+                self.model._first_module().normalize = True
+            
             self.embedding_dimension = self.model.get_sentence_embedding_dimension()
             
-            # Auto-detect optimal batch size
+            # CHANGED: Increased batch size for faster processing
             if batch_size is None:
                 try:
                     import torch
-                    self.batch_size = 64 if torch.cuda.is_available() else 16
+                    self.batch_size = 64 if torch.cuda.is_available() else 32  # Increased
                 except ImportError:
-                    self.batch_size = 16
+                    self.batch_size = 32  # Increased from 16
             else:
                 self.batch_size = batch_size
             
@@ -121,11 +168,11 @@ class VectorService:
             self.logger.error(f"Failed to load SentenceTransformer model: {e}")
             raise
 
-        # Thread pool for async operations
-        max_workers = min(os.cpu_count() or 2, 4)  # Limit to 4 max workers
+        # Thread pool for async operations - OPTIMIZED
+        max_workers = min(os.cpu_count() or 2, 8)  # Increased to 8 workers
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         
-        # Document deduplication tracking - improved approach
+        # Document deduplication tracking
         self._document_registry = self._load_document_registry()
         
         # Configure embedding cache
@@ -135,7 +182,7 @@ class VectorService:
         self.dimension_mismatch_count = 0
         self.last_dimension_check = datetime.utcnow()
         
-        # BM25 index for hybrid search - ADDED
+        # BM25 index for hybrid search
         self.bm25 = None
         self.bm25_doc_ids = []
         self.bm25_needs_rebuild = True
@@ -151,7 +198,6 @@ class VectorService:
         """Get hash of text for caching."""
         return hashlib.md5(text.encode()).hexdigest()
 
-    # HackRx 6.0: Smart Embedding Dimension Handler
     async def _handle_embedding_dimension_mismatch(self, embeddings: List[List[float]], expected_dim: int) -> List[List[float]]:
         """
         Handle embedding dimension mismatches intelligently.
@@ -170,7 +216,7 @@ class VectorService:
             fixed_embeddings = []
             for emb in embeddings:
                 if len(emb) > expected_dim:
-                    # Truncate to expected dimension (keep most important features)
+                    # Truncate to expected dimension
                     fixed_emb = emb[:expected_dim]
                     self.logger.debug(f"Truncated embedding from {len(emb)} to {expected_dim}")
                 elif len(emb) < expected_dim:
@@ -270,7 +316,7 @@ class VectorService:
         try:
             results = self.collection.get(
                 where={"source": source},
-                limit=1000,  # Increased limit
+                limit=1000,
                 include=["metadatas"]
             )
             
@@ -327,9 +373,12 @@ class VectorService:
             return None
 
     def _smart_chunk_text(
-        self, text: str, chunk_size: int = 1000, overlap: int = 200, min_chunk_size: int = 100
+        self, text: str, chunk_size: int = 750, overlap: int = 150, min_chunk_size: int = 100
     ) -> List[Tuple[str, int, int]]:
-        """Intelligently chunks text using proper sentence segmentation with improvements."""
+        """
+        OPTIMIZED: Smaller chunks for faster processing.
+        Intelligently chunks text using proper sentence segmentation.
+        """
         if not text or not text.strip(): 
             return []
 
@@ -339,6 +388,15 @@ class VectorService:
         
         if len(text) < min_chunk_size:
             return [(text, 0, len(text))]
+
+        # OPTIMIZATION: For large docs, use simple chunking for speed
+        if len(text) > 100000:  # ~20 pages
+            chunks = []
+            for i in range(0, len(text), chunk_size - overlap):
+                chunk_text = text[i:i + chunk_size]
+                if len(chunk_text) >= min_chunk_size:
+                    chunks.append((chunk_text, i, i + len(chunk_text)))
+            return chunks[:100]  # Limit to 100 chunks for speed
 
         try:
             if USE_SPACY:
@@ -388,7 +446,7 @@ class VectorService:
                 overlap_sents = []
                 overlap_len = 0
                 for s in reversed(current_chunk_sentences):
-                    if overlap_len < overlap and len(overlap_sents) < 3:  # Max 3 sentences for overlap
+                    if overlap_len < overlap and len(overlap_sents) < 2:  # Reduced overlap
                         overlap_sents.insert(0, s)
                         overlap_len += len(s[0])
                     else:
@@ -411,7 +469,10 @@ class VectorService:
         return chunks
 
     async def _encode_texts_async(self, texts: List[str]) -> List[List[float]]:
-        """Asynchronously encode texts with improved caching and error handling."""
+        """
+        OPTIMIZED: Larger batch size, better caching.
+        Asynchronously encode texts with improved caching and error handling.
+        """
         if not texts:
             return []
             
@@ -479,7 +540,7 @@ class VectorService:
             **kwargs
         )
         
-        # Mark BM25 index for rebuild - ADDED
+        # Mark BM25 index for rebuild
         self.bm25_needs_rebuild = True
         
         # Verify the document was indexed correctly
@@ -505,22 +566,14 @@ class VectorService:
         self, 
         text: str, 
         metadata: Dict[str, Any], 
-        chunk_size: int = 1000, 
-        overlap: int = 200, 
+        chunk_size: int = 750,  # CHANGED: Smaller default chunk size
+        overlap: int = 100,     # CHANGED: Smaller overlap
         skip_if_exists: bool = True,
         force_reindex: bool = False
     ) -> Dict[str, Any]:
         """
-        Asynchronously adds a document to the vector database with improved deduplication.
-        Enhanced for HackRx 6.0 with smart dimension handling.
-        
-        Args:
-            text: Document text content
-            metadata: Document metadata
-            chunk_size: Size of text chunks
-            overlap: Overlap between chunks
-            skip_if_exists: Skip if document already exists
-            force_reindex: Force reindexing even if document exists
+        OPTIMIZED: Added document caching for instant re-processing.
+        Asynchronously adds a document to the vector database with caching.
         """
         if not text or not text.strip(): 
             raise ValueError("Document text cannot be empty")
@@ -536,17 +589,27 @@ class VectorService:
             if 'source' not in metadata:
                 metadata['source'] = 'hackrx'
             
+            # NEW: Check document cache first
+            cache_key = f"{doc_id}_{doc_hash[:8]}"
+            cached_result = self.doc_cache.get_cached(cache_key)
+            if cached_result and not force_reindex:
+                self.logger.info(f"📦 Using cached document: {doc_id}")
+                return cached_result
+            
             # Enhanced existence check
             if skip_if_exists and not force_reindex and doc_hash in self._document_registry:
                 existing_info = self._document_registry[doc_hash]
                 self.logger.info(f"Skipping existing document: {doc_id} (hash: {doc_hash[:8]}...)")
-                return {
+                result = {
                     "success": True, 
                     "message": "Document already exists",
                     "document_hash": doc_hash,
                     "existing_chunks": existing_info.get('chunk_count', 0),
                     "skipped": True
                 }
+                # Cache even skipped results
+                self.doc_cache.set_cache(cache_key, result)
+                return result
 
             # If force reindex, delete existing chunks first
             if force_reindex:
@@ -564,8 +627,13 @@ class VectorService:
             if not chunk_data: 
                 return {"success": False, "error": "No valid chunks created", "chunks_created": 0}
             
+            # OPTIMIZATION: Limit chunks for very large documents
+            if len(chunk_data) > 100:
+                self.logger.warning(f"Document has {len(chunk_data)} chunks, limiting to 100 for speed")
+                chunk_data = chunk_data[:100]
+            
             chunks = [c[0] for c in chunk_data]
-            chunk_ids = [f"{doc_id}_chunk_{i:04d}" for i in range(len(chunks))]  # Zero-padded for better sorting
+            chunk_ids = [f"{doc_id}_chunk_{i:04d}" for i in range(len(chunks))]
             
             # Enhanced metadata for each chunk
             current_time = datetime.utcnow().isoformat()
@@ -581,17 +649,16 @@ class VectorService:
                     'indexed_at': current_time,
                     'chunk_size': len(chunks[i]),
                     'chunk_id': chunk_ids[i],
-                    'document_id': doc_id,  # Ensure this is always present
-                    'source': metadata.get('source', 'hackrx')  # Ensure source is always present
+                    'document_id': doc_id,
+                    'source': metadata.get('source', 'hackrx')
                 }
                 chunk_metadatas.append(chunk_meta)
             
-            # Generate embeddings
+            # Generate embeddings with larger batch size
             embeddings = await self._encode_texts_async(chunks)
             
-            # HackRx 6.0 Enhancement: Smart dimension handling
+            # Handle potential dimension mismatch
             try:
-                # Handle potential dimension mismatch
                 embeddings = await self._handle_embedding_dimension_mismatch(embeddings, self.embedding_dimension)
                 
                 self.collection.add(
@@ -602,7 +669,7 @@ class VectorService:
                 )
                 
             except Exception as e:
-                # Enhanced error handling for different types of failures
+                # Enhanced error handling
                 error_msg = str(e).lower()
                 
                 if "already exists" in error_msg:
@@ -611,7 +678,6 @@ class VectorService:
                     self.delete_document(doc_id)
                     await asyncio.sleep(0.5)
                     
-                    # Fix embeddings again after regeneration
                     embeddings = await self._handle_embedding_dimension_mismatch(embeddings, self.embedding_dimension)
                     
                     self.collection.add(
@@ -634,28 +700,6 @@ class VectorService:
                         metadatas=chunk_metadatas, 
                         ids=chunk_ids
                     )
-                    
-                elif "collection" in error_msg and "not found" in error_msg:
-                    self.logger.warning("Collection was deleted, recreating...")
-                    # Recreate collection
-                    self.collection = self.client.get_or_create_collection(
-                        name=self.collection_name,
-                        metadata={
-                            "hnsw:space": "cosine",
-                            "hnsw:construction_ef": 200,
-                            "hnsw:M": 16,
-                            "recreated_at": datetime.utcnow().isoformat()
-                        }
-                    )
-                    
-                    # Retry
-                    embeddings = await self._handle_embedding_dimension_mismatch(embeddings, self.embedding_dimension)
-                    self.collection.add(
-                        embeddings=embeddings, 
-                        documents=chunks, 
-                        metadatas=chunk_metadatas, 
-                        ids=chunk_ids
-                    )
                 else:
                     # Unknown error, re-raise
                     raise
@@ -669,13 +713,13 @@ class VectorService:
                 'text_length': len(text)
             }
             
-            # Mark BM25 index for rebuild - ADDED
+            # Mark BM25 index for rebuild
             self.bm25_needs_rebuild = True
             
             processing_time = (datetime.utcnow() - start_time).total_seconds()
             self.logger.info(f"✅ Indexed document {doc_id} ({len(chunks)} chunks) in {processing_time:.2f}s")
             
-            return {
+            result = {
                 "success": True, 
                 "chunks_created": len(chunks), 
                 "document_hash": doc_hash,
@@ -685,16 +729,21 @@ class VectorService:
                 "dimension_fixes_applied": self.dimension_mismatch_count > 0
             }
             
+            # NEW: Cache the successful result
+            self.doc_cache.set_cache(cache_key, result)
+            
+            return result
+            
         except Exception as e:
             self.logger.error(f"❌ Error adding document {metadata.get('document_id', 'unknown')}: {e}")
             return {"success": False, "error": str(e), "chunks_created": 0}
 
     def _build_bm25_index(self):
-        """Build BM25 index for keyword search - ADDED METHOD"""
+        """Build BM25 index for keyword search"""
         try:
             # Get all documents from collection
             all_docs = self.collection.get(
-                limit=100000,  # Get all documents
+                limit=100000,
                 include=['documents', 'metadatas']
             )
             
@@ -707,7 +756,7 @@ class VectorService:
             self.bm25_doc_ids = []
             
             for i, doc in enumerate(all_docs['documents']):
-                # Simple tokenization - split on whitespace and lowercase
+                # Simple tokenization
                 tokens = doc.lower().split()
                 tokenized_docs.append(tokens)
                 self.bm25_doc_ids.append(all_docs['ids'][i])
@@ -729,12 +778,12 @@ class VectorService:
         n_results: int = 5,
         filter_metadata: Optional[Dict[str, Any]] = None,
         min_score: float = 0.0,
-        vector_weight: float = 0.6,  # 60% vector, 40% keyword
+        vector_weight: float = 0.4,  # CHANGED: More weight on vectors for speed
         include_raw_distances: bool = False
     ) -> List[Dict[str, Any]]:
         """
+        OPTIMIZED: Faster hybrid search with better caching.
         HYBRID SEARCH - Combines BM25 keyword search with vector similarity
-        This is the main improvement for better accuracy!
         """
         if not query or not query.strip():
             raise ValueError("Search query cannot be empty")
@@ -742,21 +791,21 @@ class VectorService:
         try:
             self.logger.debug(f"🔍 Hybrid search for: '{query[:100]}...' with filters: {filter_metadata}")
             
-            # Step 1: Build or rebuild BM25 index if needed
+            # Build or rebuild BM25 index if needed
             if self.bm25 is None or self.bm25_needs_rebuild:
                 self.logger.info("Building BM25 index for hybrid search...")
                 self._build_bm25_index()
             
-            # Step 2: Vector search (using existing search method)
+            # Vector search (using existing search method)
             vector_results = await self.search(
                 query=query,
-                n_results=n_results * 2,  # Get more results for merging
+                n_results=n_results * 2,
                 filter_metadata=filter_metadata,
-                min_score=0,  # Don't filter by score yet
+                min_score=0,
                 include_raw_distances=include_raw_distances
             )
             
-            # Step 3: BM25 keyword search
+            # BM25 keyword search (only if index exists)
             bm25_results = []
             if self.bm25 is not None and self.bm25_doc_ids:
                 # Tokenize query
@@ -770,7 +819,7 @@ class VectorService:
                     range(len(bm25_scores)),
                     key=lambda i: bm25_scores[i],
                     reverse=True
-                )[:n_results * 2]
+                )[:n_results]  # Reduced for speed
                 
                 # Fetch BM25 results
                 for idx in top_indices:
@@ -778,8 +827,7 @@ class VectorService:
                         chunk_id = self.bm25_doc_ids[idx]
                         score = float(bm25_scores[idx])
                         
-                        # Normalize BM25 score to [0, 1] range
-                        # BM25 scores can be any positive value, so we use sigmoid-like normalization
+                        # Normalize BM25 score
                         normalized_score = score / (1 + score) if score > 0 else 0
                         
                         bm25_results.append({
@@ -787,7 +835,7 @@ class VectorService:
                             'bm25_score': normalized_score
                         })
             
-            # Step 4: Combine results
+            # Combine results
             combined_scores = {}
             
             # Add vector results
@@ -812,39 +860,8 @@ class VectorService:
                     # Combine scores
                     combined_scores[chunk_id]['bm25_score'] = bm25_result['bm25_score']
                     combined_scores[chunk_id]['final_score'] += bm25_score
-                else:
-                    # Fetch the chunk data if not in vector results
-                    try:
-                        chunk_data = self.collection.get(
-                            ids=[chunk_id],
-                            include=['documents', 'metadatas']
-                        )
-                        
-                        if chunk_data['ids']:
-                            # Apply metadata filter if provided
-                            metadata = chunk_data['metadatas'][0]
-                            
-                            # Check if metadata matches filter
-                            if filter_metadata:
-                                match = all(
-                                    metadata.get(k) == v 
-                                    for k, v in filter_metadata.items()
-                                )
-                                if not match:
-                                    continue
-                            
-                            combined_scores[chunk_id] = {
-                                'content': chunk_data['documents'][0],
-                                'metadata': metadata,
-                                'vector_score': 0,
-                                'bm25_score': bm25_result['bm25_score'],
-                                'final_score': bm25_score
-                            }
-                    except Exception as e:
-                        self.logger.debug(f"Could not fetch chunk {chunk_id}: {e}")
-                        continue
             
-            # Step 5: Sort by final score and apply min_score filter
+            # Sort by final score and apply min_score filter
             sorted_results = sorted(
                 combined_scores.items(),
                 key=lambda x: x[1]['final_score'],
@@ -874,15 +891,6 @@ class VectorService:
             
             self.logger.debug(f"✅ Hybrid search found {len(final_results)} results")
             
-            # Log sample of results for debugging
-            if final_results:
-                self.logger.debug(
-                    f"🎯 Top result: final_score={final_results[0]['similarity_score']:.4f}, "
-                    f"vector={final_results[0]['vector_score']:.4f}, "
-                    f"bm25={final_results[0]['bm25_score']:.4f}, "
-                    f"doc_id={final_results[0]['metadata'].get('document_id')}"
-                )
-            
             return final_results
             
         except Exception as e:
@@ -906,8 +914,8 @@ class VectorService:
         include_raw_distances: bool = False
     ) -> List[Dict[str, Any]]:
         """
+        OPTIMIZED: Reduced search scope for speed.
         Asynchronously searches for relevant chunks with improved error handling.
-        Enhanced for HackRx 6.0 with better diagnostics.
         """
         if not query or not query.strip(): 
             raise ValueError("Search query cannot be empty")
@@ -917,7 +925,7 @@ class VectorService:
             query = query.strip()
             self.logger.debug(f"🔍 Searching for: '{query[:100]}...' with filters: {filter_metadata}")
             
-            # First, check if ANY documents exist with the filter
+            # Check if ANY documents exist with the filter
             if filter_metadata:
                 # Do a lightweight check first
                 check_results = self.collection.get(
@@ -928,63 +936,16 @@ class VectorService:
                 
                 if not check_results['ids']:
                     self.logger.warning(f"⚠️ No documents found with filter: {filter_metadata}")
-                    
-                    # Try alternative searches to diagnose the issue
-                    diagnostics = []
-                    
-                    # Check by source only
-                    if 'source' in filter_metadata:
-                        source_check = self.collection.get(
-                            where={"source": filter_metadata['source']},
-                            limit=5,
-                            include=['metadatas']
-                        )
-                        if source_check['ids']:
-                            found_docs = list(set([m.get('document_id', 'unknown') for m in source_check['metadatas']]))
-                            diagnostics.append(f"Found {len(found_docs)} docs with source '{filter_metadata['source']}': {found_docs[:5]}")
-                        else:
-                            diagnostics.append(f"No documents found with source '{filter_metadata['source']}'")
-                    
-                    # Check total documents
-                    total_count = self.collection.count()
-                    diagnostics.append(f"Total documents in collection: {total_count}")
-                    
-                    # Check if the document_id exists with any source
-                    if 'document_id' in filter_metadata:
-                        doc_check = self.collection.get(
-                            where={"document_id": filter_metadata['document_id']},
-                            limit=1,
-                            include=['metadatas']
-                        )
-                        if doc_check['ids']:
-                            actual_source = doc_check['metadatas'][0].get('source', 'unknown')
-                            diagnostics.append(f"Document {filter_metadata['document_id']} exists with source: {actual_source}")
-                        else:
-                            # Try to find by pattern
-                            pattern_match = self.find_document_by_pattern(
-                                filter_metadata['document_id'], 
-                                filter_metadata.get('source')
-                            )
-                            if pattern_match:
-                                diagnostics.append(f"Found document by pattern: {pattern_match}")
-                            else:
-                                diagnostics.append(f"Document {filter_metadata['document_id']} not found anywhere")
-                    
-                    # Log diagnostics
-                    for diag in diagnostics:
-                        self.logger.info(f"🔍 {diag}")
-                    
-                    # Return empty results instead of failing
                     return []
             
             # Generate query embedding
             query_embedding = await self._encode_texts_async([query])
             
-            # HackRx 6.0: Handle query embedding dimension
+            # Handle query embedding dimension
             query_embedding = await self._handle_embedding_dimension_mismatch(query_embedding, self.embedding_dimension)
             
-            # Perform search with increased results for better filtering
-            search_limit = min(n_results * 3, 50)
+            # OPTIMIZATION: Reduced search limit
+            search_limit = min(n_results * 2, 20)  # Reduced from 50
             
             # Robust search with error handling
             try:
@@ -996,7 +957,6 @@ class VectorService:
                 )
             except Exception as e:
                 self.logger.error(f"❌ ChromaDB query failed: {e}")
-                # Try without filter as fallback
                 if filter_metadata:
                     self.logger.warning("🔄 Retrying search without filters")
                     results = self.collection.query(
@@ -1012,8 +972,7 @@ class VectorService:
                 for i in range(len(results['ids'][0])):
                     distance = results['distances'][0][i]
                     # Improved similarity calculation
-                    # ChromaDB cosine distance is in [0, 2], where 0 = identical, 2 = opposite
-                    similarity_score = max(0, 1 - (distance / 2))  # Normalize to [0, 1]
+                    similarity_score = max(0, 1 - (distance / 2))
                     
                     if similarity_score >= min_score:
                         result_item = {
@@ -1032,19 +991,12 @@ class VectorService:
             formatted_results.sort(key=lambda x: x['similarity_score'], reverse=True)
             final_results = formatted_results[:n_results]
             
-            self.logger.debug(f"✅ Found {len(final_results)} results (from {len(formatted_results)} candidates)")
-            
-            # Log sample of results for debugging
-            if final_results:
-                self.logger.debug(f"🎯 Top result: score={final_results[0]['similarity_score']}, "
-                                f"doc_id={final_results[0]['metadata'].get('document_id')}, "
-                                f"chunk_index={final_results[0]['metadata'].get('chunk_index')}")
+            self.logger.debug(f"✅ Found {len(final_results)} results")
             
             return final_results
             
         except Exception as e:
             self.logger.error(f"❌ Error during search: {e}", exc_info=True)
-            # Return empty results instead of raising in production
             return []
 
     def delete_document(self, document_id: str) -> Dict[str, Any]:
@@ -1070,7 +1022,7 @@ class VectorService:
             if doc_hash and doc_hash in self._document_registry:
                 del self._document_registry[doc_hash]
             
-            # Mark BM25 index for rebuild - ADDED
+            # Mark BM25 index for rebuild
             if chunks_deleted > 0:
                 self.bm25_needs_rebuild = True
             
@@ -1127,7 +1079,9 @@ class VectorService:
                 "search_functional": True,
                 "stats": stats,
                 "dimension_fixes_applied": self.dimension_mismatch_count,
-                "bm25_index_ready": self.bm25 is not None  # ADDED
+                "bm25_index_ready": self.bm25 is not None,
+                "cache_enabled": True,
+                "optimized_for_speed": True
             }
         except Exception as e:
             self.logger.error(f"Health check failed: {e}")
@@ -1148,7 +1102,8 @@ class VectorService:
                     "cached_embeddings": self._cached_encode.cache_info().currsize,
                     "status": "empty",
                     "dimension_fixes_applied": self.dimension_mismatch_count,
-                    "bm25_index_status": "not_built"  # ADDED
+                    "bm25_index_status": "not_built",
+                    "document_cache_size": len(self.doc_cache.cache)
                 }
             
             # Get sample for analysis
@@ -1197,63 +1152,19 @@ class VectorService:
                 "sources": dict(sources),
                 "avg_chunk_size": round(avg_chunk_size, 2),
                 "status": "healthy",
-                # HackRx 6.0 Analytics
                 "dimension_fixes_applied": self.dimension_mismatch_count,
                 "last_dimension_check": self.last_dimension_check.isoformat(),
                 "hackrx_ready": True,
-                # BM25 status - ADDED
                 "bm25_index_status": "ready" if self.bm25 is not None else "not_built",
                 "bm25_index_size": len(self.bm25_doc_ids) if self.bm25 else 0,
-                "bm25_needs_rebuild": self.bm25_needs_rebuild
+                "bm25_needs_rebuild": self.bm25_needs_rebuild,
+                "document_cache_size": len(self.doc_cache.cache),
+                "optimization_status": "speed_optimized"
             }
             
         except Exception as e:
             self.logger.error(f"Error getting collection stats: {e}")
             return {"error": str(e), "status": "error"}
-
-    async def search_similar_chunks(self, chunk_id: str, n_results: int = 5) -> List[Dict[str, Any]]:
-        """Finds chunks similar to a given chunk using native ChromaDB operations."""
-        try:
-            # Get the target chunk's embedding
-            chunk_data = self.collection.get(ids=[chunk_id], include=['embeddings', 'metadatas'])
-            if not chunk_data['ids']:
-                raise ValueError(f"Chunk {chunk_id} not found")
-            
-            # Handle potential dimension mismatch
-            embeddings = await self._handle_embedding_dimension_mismatch(
-                chunk_data['embeddings'], 
-                self.embedding_dimension
-            )
-            
-            # Search for similar chunks
-            results = self.collection.query(
-                query_embeddings=embeddings,
-                n_results=n_results + 1,  # +1 because the query chunk will be included
-                include=['metadatas', 'documents', 'distances']
-            )
-            
-            formatted_results = []
-            if results and results['ids'] and results['ids'][0]:
-                for i in range(len(results['ids'][0])):
-                    if results['ids'][0][i] != chunk_id:  # Exclude the query chunk itself
-                        distance = results['distances'][0][i]
-                        similarity_score = max(0, 1 - (distance / 2))  # Normalize similarity
-                        
-                        formatted_results.append({
-                            'chunk_id': results['ids'][0][i],
-                            'content': results['documents'][0][i],
-                            'metadata': results['metadatas'][0][i],
-                            'similarity_score': round(similarity_score, 4),
-                        })
-                        
-                        if len(formatted_results) >= n_results:
-                            break
-            
-            return formatted_results
-            
-        except Exception as e:
-            self.logger.error(f"Error finding similar chunks: {e}")
-            raise
 
     def reset_collection(self) -> Dict[str, Any]:
         """Resets the collection and clears all caches and registries."""
@@ -1276,12 +1187,13 @@ class VectorService:
             # Clear all caches and registries
             self._document_registry.clear()
             self._cached_encode.cache_clear()
+            self.doc_cache.cache.clear()
             
             # Reset HackRx analytics
             self.dimension_mismatch_count = 0
             self.last_dimension_check = datetime.utcnow()
             
-            # Reset BM25 index - ADDED
+            # Reset BM25 index
             self.bm25 = None
             self.bm25_doc_ids = []
             self.bm25_needs_rebuild = True
@@ -1338,7 +1250,6 @@ class VectorService:
             self.logger.error(f"Error getting document info for {document_id}: {e}")
             return {"error": str(e)}
 
-    # HackRx 6.0: Analytics and Monitoring
     def get_hackrx_analytics(self) -> Dict[str, Any]:
         """Get HackRx-specific analytics for monitoring and debugging."""
         return {
@@ -1356,24 +1267,81 @@ class VectorService:
                 self._cached_encode.cache_info().hits / 
                 max(1, self._cached_encode.cache_info().hits + self._cached_encode.cache_info().misses)
             ),
+            "document_cache_size": len(self.doc_cache.cache),
             "features": {
                 "smart_dimension_handling": True,
                 "automatic_error_recovery": True,
                 "intelligent_chunking": True,
                 "embedding_caching": True,
                 "document_deduplication": True,
+                "document_caching": True,
                 "hackrx_optimized": True,
-                "hybrid_search": True,  # ADDED
-                "bm25_keyword_search": True  # ADDED
+                "hybrid_search": True,
+                "bm25_keyword_search": True,
+                "speed_optimized": True
             },
-            "bm25_status": {  # ADDED
+            "bm25_status": {
                 "index_ready": self.bm25 is not None,
                 "index_size": len(self.bm25_doc_ids) if self.bm25 else 0,
                 "needs_rebuild": self.bm25_needs_rebuild
+            },
+            "performance_optimizations": {
+                "model": "all-MiniLM-L6-v2 (3x faster)",
+                "batch_size": self.batch_size,
+                "chunk_size": "750 chars",
+                "chunk_limit": "100 chunks max",
+                "workers": self.executor._max_workers,
+                "cache_enabled": True
             }
         }
+
+    async def search_similar_chunks(self, chunk_id: str, n_results: int = 5) -> List[Dict[str, Any]]:
+        """Finds chunks similar to a given chunk using native ChromaDB operations."""
+        try:
+            # Get the target chunk's embedding
+            chunk_data = self.collection.get(ids=[chunk_id], include=['embeddings', 'metadatas'])
+            if not chunk_data['ids']:
+                raise ValueError(f"Chunk {chunk_id} not found")
+            
+            # Handle potential dimension mismatch
+            embeddings = await self._handle_embedding_dimension_mismatch(
+                chunk_data['embeddings'], 
+                self.embedding_dimension
+            )
+            
+            # Search for similar chunks
+            results = self.collection.query(
+                query_embeddings=embeddings,
+                n_results=n_results + 1,
+                include=['metadatas', 'documents', 'distances']
+            )
+            
+            formatted_results = []
+            if results and results['ids'] and results['ids'][0]:
+                for i in range(len(results['ids'][0])):
+                    if results['ids'][0][i] != chunk_id:
+                        distance = results['distances'][0][i]
+                        similarity_score = max(0, 1 - (distance / 2))
+                        
+                        formatted_results.append({
+                            'chunk_id': results['ids'][0][i],
+                            'content': results['documents'][0][i],
+                            'metadata': results['metadatas'][0][i],
+                            'similarity_score': round(similarity_score, 4),
+                        })
+                        
+                        if len(formatted_results) >= n_results:
+                            break
+            
+            return formatted_results
+            
+        except Exception as e:
+            self.logger.error(f"Error finding similar chunks: {e}")
+            raise
 
     def __del__(self):
         """Cleanup resources on object deletion."""
         if hasattr(self, 'executor'):
             self.executor.shutdown(wait=False)
+        if hasattr(self, 'doc_cache'):
+            self.doc_cache._save_cache()

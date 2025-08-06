@@ -19,6 +19,7 @@ from .services.vector_service import VectorService
 from .services.graph_service import GraphService, FileStorageAdapter as GraphStorageAdapter
 from .models.schemas import GraphData
 from networkx.readwrite import json_graph  # Add this for graph loading
+from app.cache_manager import doc_cache
 from .dependencies import (
     get_vector_service,
     get_graph_service,
