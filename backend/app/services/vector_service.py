@@ -18,6 +18,68 @@ import time
 import pickle
 from rank_bm25 import BM25Okapi
 
+# Enhanced insurance terms for better search relevance
+insurance_terms = [
+    # Existing terms (keep all)
+    "grace period", "waiting period", "pre-existing", "maternity",
+    "sum insured", "co-payment", "deductible", "room rent",
+    "domiciliary hospitalization", "day care", "ambulance cover",
+    "AYUSH", "critical illness", "lifetime renewal", "wellness",
+    "free look", "entry age", "exit age", "claim settlement",
+    "cumulative bonus", "automatic restoration", "sub-limits",
+    "OPD coverage", "network hospitals", "policy exclusions",
+    "waiting period for specific diseases", "top-up coverage",
+    
+    # HIGH-FREQUENCY ADDITIONS for HackRx:
+    
+    # Policy Terms
+    "policy period", "policy renewal", "policy cancellation", "premium payment",
+    "policy holder", "insured person", "beneficiary", "nominee",
+    
+    # Coverage Details  
+    "coverage limit", "coverage amount", "maximum coverage", "annual limit",
+    "per incident limit", "lifetime maximum", "aggregate limit",
+    "cashless treatment", "reimbursement claim", "network provider",
+    
+    # Hospitalization
+    "pre-hospitalization", "post-hospitalization", "hospitalization expenses",
+    "ICU charges", "surgery cover", "consultation fees", "diagnostic tests",
+    "shared accommodation", "private room", "twin sharing",
+    
+    # Medical Terms
+    "medical examination", "health checkup", "preventive care",
+    "emergency treatment", "accidental injury", "illness cover",
+    "congenital diseases", "genetic disorders", "chronic conditions",
+    
+    # Exclusions & Limitations
+    "permanent exclusions", "temporary exclusions", "standard exclusions",
+    "disease-specific waiting period", "pre-existing disease waiting period",
+    "cosmetic surgery", "infertility treatment", "psychiatric treatment",
+    
+    # Claims Process
+    "claim intimation", "claim documents", "claim processing time",
+    "claim rejection", "claim settlement ratio", "grievance redressal",
+    "TPA", "third party administrator", "medical bill", "discharge summary",
+    
+    # Age & Eligibility
+    "minimum age", "maximum age", "dependent coverage", "family floater",
+    "individual policy", "group policy", "portability",
+    
+    # Specific Benefits
+    "ambulance charges", "organ donor cover", "second medical opinion",
+    "telemedicine", "home healthcare", "alternative treatment",
+    "mental health", "dental treatment", "vision care",
+    
+    # Financial Terms
+    "premium", "deductible amount", "copayment percentage", "coinsurance",
+    "no claim bonus", "loyalty bonus", "discount", "loading",
+    "sum insured restoration", "top-up benefits",
+    
+    # Regulatory
+    "IRDAI", "insurance regulator", "ombudsman", "grievance",
+    "policy document", "policy wording", "terms and conditions"
+]
+
 # Attempt to import and configure spaCy, with NLTK as a fallback for sentence splitting.
 try:
     import spacy
