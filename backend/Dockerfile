@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Pre-download the ML model to the builder stage.
 # This saves 5-10 seconds of download time on every container startup.
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+#RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
 
 # --- Stage 2: Final Application Stage ---
 # Use the same slim Python image for our final, clean application.
