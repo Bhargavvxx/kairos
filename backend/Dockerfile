@@ -21,8 +21,9 @@ COPY ./backend/requirements.txt .
 # Install PyTorch first (CPU version for smaller size)
 RUN pip install --no-cache-dir torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cpu
 
-# Install the remaining dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Filter out torch from requirements.txt to avoid conflicts, then install remaining dependencies
+RUN grep -v "^torch==" requirements.txt > requirements_filtered.txt && \
+    pip install --no-cache-dir -r requirements_filtered.txt
 
 # Pre-download the ML model to the builder stage.
 # This saves 5-10 seconds of download time on every container startup.
@@ -73,10 +74,10 @@ ENV OMP_NUM_THREADS=2
 # Expose the port that our FastAPI application will run on.
 EXPOSE 8000
 
-# Health check
+# Modified health check for Render compatibility
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:8000/health')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
 
-# The command to start the Uvicorn server when the container launches.
-# Optimized for HackRx performance
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--loop", "uvloop", "--access-log"]
+# IMPORTANT: Use PORT environment variable for Render deployment
+# Render assigns a dynamic port via the PORT environment variable
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --loop uvloop
