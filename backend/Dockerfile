@@ -38,9 +38,9 @@ COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy the pre-downloaded model cache from the builder stage to the appuser's home directory.
-COPY --from=builder /root/.cache /home/appuser/.cache
+#COPY --from=builder /root/.cache /home/appuser/.cache
 # Ensure the new user owns the cached files.
-RUN chown -R appuser:appuser /home/appuser/.cache
+# RUN chown -R appuser:appuser /home/appuser/.cache    <--- COMMENT THIS LINE
 
 # Switch to the non-root user for better security.
 USER appuser
