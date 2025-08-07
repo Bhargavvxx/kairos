@@ -62,7 +62,6 @@ data/
 *.csv
 *.xlsx
 *.json
-!railway.json
 !package.json
 !requirements.json
 
