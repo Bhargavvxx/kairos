@@ -2,17 +2,17 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install only what's absolutely needed
+# Install only essential packages
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
-# Copy and install requirements
+# Copy requirements
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app
+# Copy app code
 COPY backend/ .
 
-# Create dirs
+# Create directories
 RUN mkdir -p chroma_db graph_db cache logs
 
 EXPOSE $PORT
