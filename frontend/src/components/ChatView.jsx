@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Bot, User, Copy, Check, Clock, FileText, Trash2, Lightbulb, Send } from 'lucide-react';
+import { Bot, User, Copy, Check, Clock, FileText, Trash2, Lightbulb, Send, ChevronDown, ChevronUp, BookOpen } from 'lucide-react';
 import { askKairos } from '../api';
 
 const SUGGESTED_QUESTIONS = [
@@ -16,7 +16,9 @@ function formatMarkdown(text) {
     .replace(/\n/g, '<br />')
     .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
     .replace(/\*(.*?)\*/g, '<em>$1</em>')
-    .replace(/`(.*?)`/g, '<code class="bg-gray-200 text-gray-800 px-1 rounded text-xs">$1</code>');
+    .replace(/`(.*?)`/g, '<code class="bg-gray-200 text-gray-800 px-1 rounded text-xs">$1</code>')
+    // Highlight citation markers like [1], [2] etc.
+    .replace(/\[(\d+)\]/g, '<span class="inline-flex items-center justify-center w-5 h-5 text-[10px] font-bold bg-indigo-100 text-indigo-700 rounded-full cursor-help" title="See citation $1">$1</span>');
 }
 
 function CopyButton({ text }) {
@@ -34,6 +36,61 @@ function CopyButton({ text }) {
     >
       {copied ? <Check size={14} className="text-green-500" /> : <Copy size={14} />}
     </button>
+  );
+}
+
+function CitationList({ citations }) {
+  const [expanded, setExpanded] = useState(false);
+
+  if (!citations || citations.length === 0) return null;
+
+  const shown = expanded ? citations : citations.slice(0, 2);
+
+  return (
+    <div className="mt-2 px-1">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex items-center gap-1 text-[11px] font-medium text-indigo-600 hover:text-indigo-800 transition-colors mb-1.5"
+      >
+        <BookOpen size={12} />
+        {citations.length} source{citations.length > 1 ? 's' : ''} cited
+        {citations.length > 2 && (expanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />)}
+      </button>
+      <div className="space-y-1.5">
+        {shown.map((cit) => (
+          <div
+            key={cit.id}
+            className="flex items-start gap-2 bg-gray-50 border border-gray-100 rounded-lg px-3 py-2 text-xs"
+          >
+            <span className="flex-shrink-0 w-5 h-5 flex items-center justify-center bg-indigo-100 text-indigo-700 rounded-full font-bold text-[10px]">
+              {cit.id}
+            </span>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2 mb-0.5">
+                <span className="font-medium text-gray-700 truncate">{cit.source}</span>
+                {cit.page && <span className="text-gray-400">p.{cit.page}</span>}
+                <span className={`ml-auto text-[10px] px-1.5 py-0.5 rounded-full ${
+                  cit.score >= 0.7 ? 'bg-green-50 text-green-600' :
+                  cit.score >= 0.4 ? 'bg-yellow-50 text-yellow-600' :
+                  'bg-red-50 text-red-500'
+                }`}>
+                  {Math.round(cit.score * 100)}%
+                </span>
+              </div>
+              <p className="text-gray-500 leading-snug line-clamp-2">{cit.snippet}</p>
+            </div>
+          </div>
+        ))}
+      </div>
+      {!expanded && citations.length > 2 && (
+        <button
+          onClick={() => setExpanded(true)}
+          className="text-[11px] text-gray-400 hover:text-indigo-500 mt-1 transition-colors"
+        >
+          + {citations.length - 2} more
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -70,6 +127,7 @@ export default function ChatView({ messages, setMessages }) {
         from: 'bot',
         text: '',
         sources: response.sources || [],
+        citations: response.citations || [],
         confidence: response.confidence || 0,
         processingTime: response.processing_time || 0,
         timestamp: Date.now(),
@@ -186,6 +244,10 @@ export default function ChatView({ messages, setMessages }) {
                     </span>
                   ))}
                 </div>
+              )}
+              {/* Chunk-level citations */}
+              {msg.citations && msg.citations.length > 0 && (
+                <CitationList citations={msg.citations} />
               )}
             </div>
             {msg.from === 'user' && (

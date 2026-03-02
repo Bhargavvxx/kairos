@@ -11,6 +11,10 @@ from pydantic import BaseModel, Field
 from app.dependencies import get_vector_service, get_graph_service, get_llm_client
 from app.services.vector_service import VectorService
 from app.services.graph_service import GraphService
+from app.services.reranker import rerank
+from app.services.entity_extractor import extract_entities_llm
+from app.services.confidence_scorer import compute_confidence
+from app.services.citation_formatter import build_answer_prompt_with_citations, build_citations
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +32,21 @@ class ChatRequest(BaseModel):
     max_results: int = Field(default=5, ge=1, le=20)
 
 
+class Citation(BaseModel):
+    id: int
+    chunk_id: str = ""
+    source: str = ""
+    page: Optional[Any] = None
+    snippet: str = ""
+    score: float = 0.0
+
+
 class ChatResponse(BaseModel):
     answer: str
     sources: List[str] = Field(default_factory=list)
+    citations: List[Citation] = Field(default_factory=list)
     confidence: float = 0.0
+    confidence_details: Optional[Dict[str, Any]] = None
     processing_time: float = 0.0
     graph_context: Optional[Dict[str, Any]] = None
 
@@ -61,30 +76,6 @@ class GraphResponse(BaseModel):
     links: List[Dict[str, Any]] = Field(default_factory=list)
 
 
-# --- Helper: build an LLM prompt from context chunks ---
-
-def _build_answer_prompt(query: str, chunks: List[Dict[str, Any]]) -> str:
-    context_parts = []
-    for i, chunk in enumerate(chunks, 1):
-        content = chunk.get("content", "")
-        source = chunk.get("metadata", {}).get("filename", f"chunk_{i}")
-        context_parts.append(f"[Source: {source}]\n{content}")
-
-    context_text = "\n\n---\n\n".join(context_parts)
-
-    return f"""You are KAIROS, an intelligent document analysis assistant.
-Answer the user's question using ONLY the context provided below.
-If the context does not contain enough information, say so honestly.
-Format your answer with markdown for readability.
-
-CONTEXT:
-{context_text}
-
-QUESTION: {query}
-
-ANSWER:"""
-
-
 # --- Endpoints ---
 
 @router.post("/chat", response_model=ChatResponse)
@@ -95,37 +86,56 @@ async def chat(
     llm_client: Any = Depends(get_llm_client),
 ):
     """
-    RAG-powered chat endpoint.
-    Retrieves relevant document chunks, optionally queries the knowledge graph,
-    and generates an answer with the LLM.
+    Production RAG chat endpoint.
+
+    Pipeline: retrieve → rerank → extract entities → graph context →
+    build cited prompt → LLM generate → confidence score → respond.
     """
     start = time.time()
 
-    # 1. Vector search
+    # ── 1. Retrieve (fetch extra candidates for the reranker) ──────────
     try:
+        retrieval_count = min(request.max_results * 3, 20)
         search_results = await vector_service.search(
             query=request.query,
-            n_results=request.max_results,
+            n_results=retrieval_count,
         )
     except Exception as e:
         logger.error(f"Vector search failed: {e}")
         search_results = []
 
-    # 2. (Optional) Graph context
+    # ── 2. Rerank with cross-encoder ──────────────────────────────────
+    if search_results:
+        try:
+            search_results = await rerank(
+                query=request.query,
+                chunks=search_results,
+                top_k=request.max_results,
+            )
+        except Exception as e:
+            logger.warning(f"Reranking failed (non-fatal): {e}")
+            search_results = search_results[: request.max_results]
+
+    # ── 3. Entity extraction + graph context ──────────────────────────
     graph_context = None
     if request.include_graph:
         try:
-            # Extract potential entity names from the query (simple heuristic)
-            words = [w for w in request.query.split() if len(w) > 2]
-            entity_results = await graph_service.query_for_orchestrator(words)
-            if entity_results.get("found_entities"):
-                graph_context = entity_results
+            entities = await extract_entities_llm(request.query, llm_client)
+            if entities:
+                entity_results = await graph_service.query_for_orchestrator(entities)
+                if entity_results.get("found_entities"):
+                    graph_context = entity_results
         except Exception as e:
-            logger.warning(f"Graph query failed (non-fatal): {e}")
+            logger.warning(f"Entity extraction / graph query failed (non-fatal): {e}")
 
-    # 3. Generate answer with LLM
+    # ── 4. Build cited prompt & generate answer ───────────────────────
+    citations_list: List[Dict[str, Any]] = []
     if search_results:
-        prompt = _build_answer_prompt(request.query, search_results)
+        prompt, citations_list = build_answer_prompt_with_citations(
+            query=request.query,
+            chunks=search_results,
+            graph_context=graph_context,
+        )
         try:
             answer = await llm_client.generate(prompt)
         except Exception as e:
@@ -137,27 +147,31 @@ async def chat(
             "Please upload documents first so I can answer your questions."
         )
 
-    # 4. Collect source filenames
+    # ── 5. Multi-signal confidence ────────────────────────────────────
+    confidence_result = compute_confidence(search_results, answer)
+    confidence = confidence_result["score"]
+    confidence_details = confidence_result["details"]
+
+    # ── 6. Collect source filenames (deduped) ─────────────────────────
     sources: List[str] = []
     seen = set()
     for r in search_results:
-        fname = r.get("metadata", {}).get("filename") or r.get("metadata", {}).get("original_filename", "unknown")
+        fname = (
+            r.get("metadata", {}).get("filename")
+            or r.get("metadata", {}).get("original_filename", "unknown")
+        )
         if fname not in seen:
             sources.append(fname)
             seen.add(fname)
-
-    # 5. Confidence heuristic
-    confidence = 0.0
-    if search_results:
-        scores = [r.get("similarity_score", 0) for r in search_results]
-        confidence = round(sum(scores) / len(scores), 2) if scores else 0.0
 
     elapsed = round(time.time() - start, 3)
 
     return ChatResponse(
         answer=answer,
         sources=sources,
+        citations=[Citation(**c) for c in citations_list],
         confidence=confidence,
+        confidence_details=confidence_details,
         processing_time=elapsed,
         graph_context=graph_context,
     )
