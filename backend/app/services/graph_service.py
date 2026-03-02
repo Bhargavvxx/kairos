@@ -301,7 +301,7 @@ class GraphService:
         except ValueError:
             return False
 
-    def get_hackrx_analytics(self) -> Dict[str, Any]:
+    def get_extraction_analytics(self) -> Dict[str, Any]:
         """Get analytics on type mappings and extraction performance."""
         return {
             "type_mappings_used": dict(self.type_usage_stats),
@@ -332,7 +332,7 @@ class GraphService:
     # Legacy method for backward compatibility
     def get_type_usage_analytics(self) -> Dict[str, Any]:
         """Get analytics on type mappings for monitoring and improvement."""
-        return self.get_hackrx_analytics()
+        return self.get_extraction_analytics()
 
     async def _load_graph(self):
         """Loads graph data from the storage adapter on startup."""
@@ -429,7 +429,7 @@ class GraphService:
                     'version': GRAPH_SCHEMA_VERSION,
                     'saved_at': datetime.now(timezone.utc).isoformat(),
                     'stats': dict(self.stats),
-                    'hackrx_analytics': self.get_hackrx_analytics(),
+                    'extraction_analytics': self.get_extraction_analytics(),
                     'type_usage_stats': dict(self.type_usage_stats),
                     'node_count': self.graph.number_of_nodes(),
                     'edge_count': self.graph.number_of_edges()
@@ -1774,7 +1774,7 @@ JSON:"""
             "edge_types": dict(edge_types),
             "graph_density": round(nx.density(self.graph), 4) if self.graph.number_of_nodes() > 0 else 0,
             "extraction_stats": dict(self.stats),
-            "hackrx_analytics": self.get_hackrx_analytics(),
+            "extraction_analytics": self.get_extraction_analytics(),
             "index_size": len(self._id_index),
             "cache_size": len(self._entity_cache),
             "document_count": len(doc_stats),

@@ -1,4 +1,4 @@
-# backend/app/routers/hackrx.py
+# backend/app/routers/batch.py
 
 import logging
 import httpx
@@ -19,7 +19,7 @@ from email import policy
 from email.parser import BytesParser
 
 # Import authentication
-from app.auth import verify_hackrx_token
+from app.auth import verify_batch_token
 
 # Import dependencies and services
 from app.dependencies import get_vector_service, get_graph_service, get_llm_client
@@ -203,12 +203,12 @@ class RateLimiter:
 rate_limiter = RateLimiter(requests_per_minute=30, max_concurrent=MAX_CONCURRENT_LLM_CALLS)
 
 # Request/Response Models
-class HackRxRequest(BaseModel):
+class BatchRequest(BaseModel):
     documents: HttpUrl  # PDF blob URL
     questions: List[str] = Field(..., max_length=100, description="List of questions (max 100)")
     model: Optional[str] = None  # Allow model selection
 
-class HackRxResponse(BaseModel):
+class BatchResponse(BaseModel):
     answers: List[str]
 
 # Internal detailed response model
@@ -221,7 +221,7 @@ class DetailedAnswer(BaseModel):
     token_usage: Dict[str, Any]
 
 # Router setup
-router = APIRouter(prefix="/hackrx", tags=["HackRx Competition"])
+router = APIRouter(prefix="/batch", tags=["Batch Processing"])
 
 # Cache for repeated questions
 answer_cache: Dict[str, str] = {}
@@ -234,9 +234,9 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 # Custom authentication wrapper
-async def verify_hackrx_token_with_proper_errors(
+async def verify_batch_token_with_errors(
     request: Request,
-    token: str = Depends(verify_hackrx_token)
+    token: str = Depends(verify_batch_token)
 ) -> str:
     """Wrapper to handle missing auth header properly"""
     if "authorization" not in request.headers:
@@ -526,7 +526,7 @@ async def call_llm_with_rate_limit(llm_client, prompt: str, is_json: bool = Fals
 async def parallel_document_processing(
     text_content: str,
     doc_id: str,
-    request: HackRxRequest,
+    request: BatchRequest,
     vector_service: VectorService,
     graph_service: GraphService,
     llm_client
@@ -547,7 +547,7 @@ async def parallel_document_processing(
         text=text_content,
         metadata={
             "document_id": doc_id,
-            "source": "hackrx",
+            "source": "batch",
             "url": str(request.documents),
             "indexed_at": time.time()
         },
@@ -567,11 +567,11 @@ async def parallel_document_processing(
     
     return vector_success, actual_doc_id, graph_success
 
-@router.post("/run", response_model=HackRxResponse)
-async def run_hackrx_submission(
-    request: HackRxRequest,
+@router.post("/run", response_model=BatchResponse)
+async def run_batch_submission(
+    request: BatchRequest,
     req: Request,
-    token: str = Depends(verify_hackrx_token_with_proper_errors),
+    token: str = Depends(verify_batch_token_with_errors),
     vector_service: VectorService = Depends(get_vector_service),
     graph_service: GraphService = Depends(get_graph_service),
     llm_client = Depends(get_llm_client)
@@ -631,14 +631,14 @@ async def run_hackrx_submission(
             
             # Setup document processing
             timestamp = int(time.time() * 1000)
-            doc_id = f"hackrx_{timestamp}_{str(uuid.uuid4())[:8]}"
+            doc_id = f"batch_{timestamp}_{str(uuid.uuid4())[:8]}"
             
             # Clear previous documents if configured
             if CLEAR_PREVIOUS_DOCS:
-                logger.info(f"[{request_id}] Clearing previous hackrx documents")
+                logger.info(f"[{request_id}] Clearing previous batch documents")
                 try:
-                    hackrx_docs = vector_service.get_documents_by_source("hackrx")
-                    for doc in hackrx_docs[:5]:  # Limit to 5 for speed
+                    batch_docs = vector_service.get_documents_by_source("batch")
+                    for doc in batch_docs[:5]:  # Limit to 5 for speed
                         doc_id_to_delete = doc.get('document_id')
                         if doc_id_to_delete:
                             vector_service.delete_document(doc_id_to_delete)
@@ -716,7 +716,7 @@ async def run_hackrx_submission(
         logger.info(f"[{request_id}] Completed in {total_time:.2f}s")
         logger.info(f"[{request_id}] Average: {total_time/len(request.questions):.2f}s per question")
         
-        return HackRxResponse(answers=final_answers)
+        return BatchResponse(answers=final_answers)
         
     except HTTPException:
         raise
@@ -758,7 +758,7 @@ async def process_question_optimized(
         search_results = await vector_service.hybrid_search(
             query=question,
             n_results=MAX_CHUNKS_PER_QUESTION,
-            filter_metadata={"source": "hackrx"},
+            filter_metadata={"source": "batch"},
             min_score=0.0,
             vector_weight=HYBRID_SEARCH_WEIGHT
         )
@@ -1022,7 +1022,7 @@ async def health_check():
     """Check if the service is running."""
     return {
         "status": "healthy",
-        "service": "hackrx",
+        "service": "batch",
         "version": "4.0-vector-primary-with-pattern-fallback",
         "cache_size": len(detailed_answer_cache),
         "doc_cache_size": len(doc_processing_cache.cache),

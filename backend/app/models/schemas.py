@@ -805,7 +805,7 @@ class QueryResponse(BaseModel):
 
 # --- Query Result Models ---
 
-class HackRxQueryResult(BaseModel):
+class BatchQueryResult(BaseModel):
     """Result model for batch document queries."""
     question: str
     answer: str
@@ -834,7 +834,7 @@ class HackRxQueryResult(BaseModel):
                                     value[k] = list(val)
         return v
 
-class HackRxProcessingMetrics(BaseModel):
+class BatchProcessingMetrics(BaseModel):
     """Metrics for batch document processing."""
     total_questions: int
     successful_answers: int

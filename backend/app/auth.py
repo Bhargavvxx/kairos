@@ -17,20 +17,20 @@ import os
 
 logger = logging.getLogger(__name__)
 
-# API token - set via HACKRX_TOKEN environment variable in production
-HACKRX_TOKEN = os.getenv("HACKRX_TOKEN")
-if not HACKRX_TOKEN:
-    logger.warning("HACKRX_TOKEN not set in environment. Using default development token.")
-    HACKRX_TOKEN = "9e7c168e23eaafaf430e54afa3c6e922a0cea39395cc06796e02aa0a7962f31f"
+# API token - set via API_TOKEN environment variable in production
+API_TOKEN = os.getenv("API_TOKEN")
+if not API_TOKEN:
+    logger.warning("API_TOKEN not set in environment. Using default development token.")
+    API_TOKEN = "9e7c168e23eaafaf430e54afa3c6e922a0cea39395cc06796e02aa0a7962f31f"
 
 # Additional tokens for different access levels (optional)
 API_TOKENS = {
-    HACKRX_TOKEN: {
+    API_TOKEN: {
         "name": "API Access",
-        "level": "competition",
+        "level": "admin",
         "rate_limit": 100,  # requests per hour
         "expires": None,    # No expiration
-        "permissions": ["hackrx", "documents", "health"]
+        "permissions": ["batch", "documents", "health"]
     },
     # Add more tokens as needed for different users/services
 }
@@ -121,10 +121,10 @@ def log_auth_attempt(token: str, success: bool, endpoint: str, ip_address: str =
         f"Endpoint: {endpoint} | IP: {ip_address or 'unknown'}"
     )
 
-async def verify_hackrx_token(
+async def verify_batch_token(
     credentials: HTTPAuthorizationCredentials = Security(security)
 ) -> str:
-    """Verify the API bearer token."""
+    """Verify the API bearer token for batch endpoints."""
     if not credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -137,30 +137,30 @@ async def verify_hackrx_token(
     # Check if token exists
     token_info = get_token_info(token)
     if not token_info:
-        log_auth_attempt(token, False, "hackrx")
+        log_auth_attempt(token, False, "batch")
         raise AuthenticationError("Invalid authentication token")
     
     # Check token expiration
     if token_info.get("expires"):
         expire_time = datetime.fromisoformat(token_info["expires"])
         if datetime.now(timezone.utc) > expire_time:
-            log_auth_attempt(token, False, "hackrx")
+            log_auth_attempt(token, False, "batch")
             raise AuthenticationError("Token has expired")
     
     # Check rate limiting
-    if not check_rate_limit(token, "hackrx"):
-        log_auth_attempt(token, False, "hackrx")
+    if not check_rate_limit(token, "batch"):
+        log_auth_attempt(token, False, "batch")
         raise RateLimitError(
             f"Rate limit exceeded. Maximum {token_info.get('rate_limit', 60)} requests per hour."
         )
     
     # Check permissions
     permissions = token_info.get("permissions", [])
-    if "hackrx" not in permissions:
-        log_auth_attempt(token, False, "hackrx")
-        raise AuthenticationError("Token does not have hackrx permissions")
+    if "batch" not in permissions:
+        log_auth_attempt(token, False, "batch")
+        raise AuthenticationError("Token does not have batch permissions")
     
-    log_auth_attempt(token, True, "hackrx")
+    log_auth_attempt(token, True, "batch")
     return token
 
 async def verify_api_token(
@@ -345,5 +345,5 @@ async def auth_health_check() -> Dict[str, Any]:
         "status": "healthy",
         "tokens_configured": len(API_TOKENS),
         "rate_limit_entries": len(rate_limit_storage),
-        "hackrx_token_valid": HACKRX_TOKEN in API_TOKENS
+        "api_token_valid": API_TOKEN in API_TOKENS
     }

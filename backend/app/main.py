@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 # Import our router and services
 from .routers import documents
-from .routers import hackrx
+from .routers import batch
 from .routers import query
 from .services.vector_service import VectorService
 from .services.graph_service import GraphService, FileStorageAdapter as GraphStorageAdapter
@@ -565,7 +565,7 @@ async def add_process_time_header(request, call_next):
     return response
 
 app.include_router(documents.router)
-app.include_router(hackrx.router)
+app.include_router(batch.router)
 app.include_router(query.router)
 
 # --- Additional API Endpoints ---
